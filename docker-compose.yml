@@ -1,0 +1,89 @@
+name: harddisk-lifecycle
+
+# Todos los servicios usan la misma imagen (ver Dockerfile) y ven el proyecto en /app:
+# ./data → /app/data y ./output → /app/output, igual que al ejecutar en local.
+x-app: &app
+  image: harddisk-lifecycle:latest
+  init: true
+
+x-built: &built
+  image:
+    condition: service_completed_successfully
+
+# Muestra de datos (valores en .env): la valida y completa with-data.sh antes de cada job
+x-sample: &sample
+  DS_QUARTER: ${DS_QUARTER:-Q2_2026}
+  DS_START: ${DS_START:-}
+  DS_DAYS: ${DS_DAYS:-7}
+
+x-healthcheck: &healthcheck
+  interval: 5s
+  timeout: 5s
+  retries: 30
+  start_period: 10s
+
+services:
+  # Construye la imagen compartida una sola vez; el resto de servicios depende de él.
+  image:
+    <<: *app
+    build: .
+    command: ["true"]
+
+  # Solo valida / descarga la muestra, sin levantar Spark. Está en el perfil «tools» para
+  # que `docker compose up` no lo ejecute a la vez que part-a (que ya valida por su cuenta):
+  #   docker compose run --rm download [--days 14 …]
+  download:
+    <<: *app
+    profiles: ["tools"]
+    entrypoint: ["entrypoint.sh", "python", "-m", "drivestats.download"]
+    command: []
+    environment: *sample
+    volumes:
+      - ./data:/app/data
+    depends_on: *built
+
+  spark-master:
+    <<: *app
+    command: ["spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"
+    depends_on: *built
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080', timeout=3)"]
+
+  spark-worker:
+    <<: *app
+    command: ["spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077",
+              "--cores", "${SPARK_WORKER_CORES:-2}", "--memory", "${SPARK_WORKER_MEMORY:-2g}"]
+    deploy:
+      replicas: ${SPARK_WORKERS:-2}
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8081', timeout=3)"]
+
+  # Driver de la Parte A. with-data.sh valida la muestra (y descarga lo que falte) antes de
+  # spark-submit; si la validación falla, el job no arranca. Los argumentos extra van al job:
+  #   docker compose run --rm part-a --top 40
+  part-a:
+    <<: *app
+    entrypoint: ["entrypoint.sh", "with-data.sh",
+                 "spark-submit", "--master", "spark://spark-master:7077", "jobs/part_a.py"]
+    command: []
+    environment: *sample
+    ports:
+      - "${SPARK_APP_UI_PORT:-4040}:4040"
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+    depends_on:
+      spark-worker:
+        condition: service_healthy

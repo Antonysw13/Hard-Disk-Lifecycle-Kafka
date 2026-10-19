@@ -1,0 +1,32 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Cachés de herramientas (ruff, pytest, ty, cobertura)
+.ruff_cache/
+.pytest_cache/
+.ty_cache/
+.coverage
+htmlcov/
+
+# Spark (ejecuciones locales)
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Notebooks, editores y sistema
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+*:Zone.Identifier
+
+# Datos descargados y resultados generados (las carpetas se conservan con .gitkeep)
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
