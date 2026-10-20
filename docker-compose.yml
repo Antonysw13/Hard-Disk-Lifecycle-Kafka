@@ -76,7 +76,27 @@ services:
   part-a:
     <<: *app
     entrypoint: ["entrypoint.sh", "with-data.sh",
-                 "spark-submit", "--master", "spark://spark-master:7077", "jobs/part_a.py"]
+                 "spark-submit", "--master", "spark://spark-master:7077", "part_a/job.py"]
+    command: []
+    environment: *sample
+    ports:
+      - "${SPARK_APP_UI_PORT:-4040}:4040"
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+    depends_on:
+      spark-worker:
+        condition: service_healthy
+
+  # Driver de la Parte B: tiempos con 2, 8, 32 y 200 particiones y sesgo del reparto por
+  # modelo. Está en su propio perfil para que no corra a la vez que part-a: dos jobs en el
+  # mismo clúster se quitan núcleos y falsean los tiempos.
+  #   docker compose run --rm part-b --repeats 10
+  part-b:
+    <<: *app
+    profiles: ["part-b"]
+    entrypoint: ["entrypoint.sh", "with-data.sh",
+                 "spark-submit", "--master", "spark://spark-master:7077", "part_b/job.py"]
     command: []
     environment: *sample
     ports:

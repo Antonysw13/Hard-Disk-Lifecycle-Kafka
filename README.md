@@ -7,7 +7,7 @@ Kafka sobre los datos reales de vida útil de discos duros de
 | Parte | Tema                | Estado    |
 | ----- | ------------------- | --------- |
 | A     | MapReduce           | ✅ Hecha  |
-| B     | Balanceo de carga   | Pendiente |
+| B     | Balanceo de carga   | ✅ Hecha  |
 | C     | Streaming con Kafka | Pendiente |
 | D     | MongoDB (opcional)  | Pendiente |
 
@@ -156,6 +156,15 @@ part-a (driver) ──► spark-master :7077 ──► spark-worker ×N (executo
   vida útil: los discos ya funcionaban antes del 1 de abril (truncamiento por la izquierda).
   Para estimar su edad real haría falta `smart_9_raw` (horas encendido).
 
+## Parte B: Balanceo de carga
+
+```bash
+docker compose run --rm part-b   # tiempos con 2, 8, 32 y 200 particiones + sesgo por modelo
+```
+
+Toda la lógica, la tabla de tiempos y la explicación del sesgo están en
+[`part_b/README.md`](part_b/README.md). Las salidas quedan en `output/part_b/`.
+
 ## Desarrollo local (opcional)
 
 ```bash
@@ -163,7 +172,9 @@ uv sync                      # entorno con PySpark, ruff y pytest
 uv run pytest                # pruebas de las fórmulas y de la validación de datos
 uv run ruff check && uv run ruff format
 uv run python -m drivestats.download         # valida/descarga data/raw (DS_* o por defecto)
-uv run spark-submit --master "local[*]" jobs/part_a.py   # necesita Java 17+ en el PATH
+# necesitan Java 17+ en el PATH; PYTHONPATH=. para que se importen part_a y part_b
+PYTHONPATH=. uv run spark-submit --master "local[*]" part_a/job.py
+PYTHONPATH=. uv run spark-submit --master "local[*]" part_b/job.py
 ```
 
 ## Estructura
@@ -171,16 +182,21 @@ uv run spark-submit --master "local[*]" jobs/part_a.py   # necesita Java 17+ en 
 ```text
 ├── Dockerfile               # imagen única: Python 3.12 + Java 21 + PySpark (vía uv)
 ├── .env                     # muestra de datos: DS_QUARTER, DS_START, DS_DAYS
-├── docker-compose.yml       # image, download, spark-master, spark-worker ×N, part-a
+├── docker-compose.yml       # image, download, spark-master, spark-worker ×N, part-a, part-b
 ├── conf/log4j2.properties   # logs de Spark en WARN
 ├── docker/entrypoint.sh     # anuncia la IP del contenedor a los demás nodos de Spark
 ├── docker/with-data.sh      # valida/descarga la muestra y después lanza el job
-├── jobs/part_a.py           # punto de entrada de spark-submit
-├── src/drivestats/
+├── src/drivestats/          # código común a todas las partes
 │   ├── download.py          # validación con manifest.json + descarga parcial con HTTP Range
-│   ├── metrics.py           # AFR e intervalo de confianza de Poisson
-│   └── part_a.py            # MapReduce, verificación y censura
-└── tests/                   # test_metrics.py (fórmulas), test_download.py (validación)
+│   └── metrics.py           # AFR e intervalo de confianza de Poisson
+├── part_a/
+│   ├── job.py               # punto de entrada de spark-submit
+│   └── mapreduce.py         # MapReduce, verificación y censura
+├── part_b/
+│   ├── job.py               # punto de entrada de spark-submit
+│   ├── balancing.py         # tiempos por particiones y sesgo del reparto por modelo
+│   └── README.md            # lógica, resultados y explicación del sesgo
+└── tests/                   # test_metrics.py, test_download.py, test_part_b.py
 ```
 
 ## Datos

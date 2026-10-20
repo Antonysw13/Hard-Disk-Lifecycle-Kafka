@@ -28,12 +28,14 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
-# PySpark trae Spark completo (jars y scripts spark-class / spark-submit)
+# PySpark trae Spark completo (jars y scripts spark-class / spark-submit).
+# PYTHONPATH=/app: driver y executors importan los paquetes part_a y part_b del proyecto.
 ENV SPARK_HOME=/opt/venv/lib/python3.12/site-packages/pyspark \
     SPARK_CONF_DIR=/app/conf \
     SPARK_WORKER_DIR=/tmp/spark-worker \
     PYSPARK_PYTHON=/opt/venv/bin/python \
-    PYSPARK_DRIVER_PYTHON=/opt/venv/bin/python
+    PYSPARK_DRIVER_PYTHON=/opt/venv/bin/python \
+    PYTHONPATH=/app
 
 # Usuario sin privilegios; el UID coincide con el del host para que ./output sea tuyo
 ARG UID=1000

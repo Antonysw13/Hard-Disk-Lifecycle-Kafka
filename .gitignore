@@ -30,3 +30,4 @@ data/*
 !data/.gitkeep
 output/*
 !output/.gitkeep
+*.docx
