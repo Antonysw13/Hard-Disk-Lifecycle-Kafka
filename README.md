@@ -8,13 +8,47 @@ Kafka sobre los datos reales de vida útil de discos duros de
 | ----- | ------------------- | --------- |
 | A     | MapReduce           | ✅ Hecha  |
 | B     | Balanceo de carga   | ✅ Hecha  |
-| C     | Streaming con Kafka | Pendiente |
+| C     | Streaming con Kafka | ✅ Hecha  |
 | D     | MongoDB (opcional)  | Pendiente |
 
 ## Requisitos
 
 Solo **Docker con Compose v2**. En Windows: Docker Desktop con la integración WSL activada
 (*Settings → Resources → WSL integration*). Python, Java 21 y Spark 4.2 van dentro de la imagen.
+
+## Pipeline completo: `docker compose up`
+
+```bash
+docker compose up     # A → B → C, cada etapa solo si la anterior terminó bien
+docker compose down   # apaga Spark y Kafka
+```
+
+`docker compose up` levanta la infraestructura (Spark y Kafka) y ejecuta las tres partes como
+un pipeline:
+
+```text
+pipeline-a ──(termina con código 0)──► pipeline-b ──(código 0)──► pipeline-c ──► fin
+ MapReduce                             balanceo                    streaming
+```
+
+- **Encadenadas con `depends_on`.** Cada etapa depende de la anterior con
+  `condition: service_completed_successfully`, así que Compose no la arranca hasta que la
+  anterior haya terminado con éxito.
+- **Si una etapa falla, el pipeline se corta ahí.** Por ejemplo, si la verificación de la
+  Parte A no cuadra, B y C no se ejecutan, y `docker compose up` termina con error:
+  `service "pipeline-a" didn't complete successfully: exit 1`.
+- **Solo verás la salida de las etapas**, con su prefijo (`pipeline-a-1 | …`). Spark y Kafka
+  llevan `attach: false`: no mezclan sus logs y siguen arriba al terminar, por si quieres
+  mirar la UI de Spark en <http://localhost:8080>. `docker compose down` los apaga.
+- **Cada etapa valida los datos antes de empezar.** La primera descarga lo que falte; las
+  demás solo verifican, en menos de un segundo.
+- **Tarda unos 19 minutos** con la muestra por defecto: A ~2 min, B ~14 min (repite 5 veces
+  cada número de particiones, y con 200 cada repetición tarda ~1 min) y C ~3 min. La primera
+  vez, además, construye la imagen y descarga los datos.
+- **Tras cambiar código**, usa `docker compose up --build` para reconstruir la imagen.
+
+Cada parte se sigue pudiendo ejecutar sola, con argumentos propios:
+`docker compose run --rm part-a` (o `part-b`, `part-c`), como se explica abajo.
 
 ## Parte A: MapReduce
 
@@ -23,9 +57,6 @@ docker compose run --rm part-a   # construye la imagen, levanta Spark (1 master 
                                  # valida los datos (y descarga lo que falte) y ejecuta la Parte A
 docker compose down              # apaga el clúster
 ```
-
-`docker compose up` también sirve: hace lo mismo, pero se queda mostrando los logs del clúster
-hasta que pulses Ctrl+C.
 
 La primera vez tarda unos minutos porque construye la imagen y descarga unos 160 MB de datos.
 Después, cada ejecución tarda alrededor de un minuto.
@@ -103,7 +134,8 @@ part-a (driver) ──► spark-master :7077 ──► spark-worker ×N (executo
   `spark://spark-master:7077`. Los workers leen los CSV desde el mismo `./data` montado; el
   driver escribe los resultados en `./output`.
 - **`download`** está en el perfil `tools`: `docker compose up` no lo arranca, para que no
-  descargue a la vez que `part-a`. `docker compose run --rm download` lo activa solo.
+  descargue a la vez que las etapas del pipeline. `docker compose run --rm download` lo activa
+  solo.
 
 ### Qué calcula
 
@@ -165,11 +197,31 @@ docker compose run --rm part-b   # tiempos con 2, 8, 32 y 200 particiones + sesg
 Toda la lógica, la tabla de tiempos y la explicación del sesgo están en
 [`part_b/README.md`](part_b/README.md). Las salidas quedan en `output/part_b/`.
 
+## Parte C: Streaming con Kafka
+
+```bash
+docker compose run --rm part-c   # levanta Kafka y Spark, publica un día cada 10 s y agrega
+                                 # por modelo en ventanas de 7 días con watermark de 2 días
+docker compose down              # apaga Spark y Kafka
+```
+
+Un producer en Python publica en Kafka los registros día por día, con reloj acelerado (un día
+cada 10 s) y filtrando 5 modelos (unos 120.000 eventos por día). Structured Streaming los
+agrupa por modelo en ventanas de 7 días de tiempo de evento, con watermark de 2 días, y
+calcula días-disco, fallas y AFR por ventana. Un 2 % de los discos llega con un día de
+retraso, para ver cómo el watermark absorbe los datos desordenados. Al cerrarse todas las
+ventanas, el job compara el resultado con el mismo cálculo en batch sobre los CSV y termina
+solo. Tarda unos 3 minutos.
+
+La lógica, las opciones (`STREAM_*` en `.env`), los resultados y el experimento con eventos
+que llegan después de cerrarse su ventana están en [`part_c/README.md`](part_c/README.md). Las
+salidas quedan en `output/part_c/`.
+
 ## Desarrollo local (opcional)
 
 ```bash
 uv sync                      # entorno con PySpark, ruff y pytest
-uv run pytest                # pruebas de las fórmulas y de la validación de datos
+uv run pytest                # pruebas de las fórmulas, la validación de datos y las partes B y C
 uv run ruff check && uv run ruff format
 uv run python -m drivestats.download         # valida/descarga data/raw (DS_* o por defecto)
 # necesitan Java 17+ en el PATH; PYTHONPATH=. para que se importen part_a y part_b
@@ -181,8 +233,10 @@ PYTHONPATH=. uv run spark-submit --master "local[*]" part_b/job.py
 
 ```text
 ├── Dockerfile               # imagen única: Python 3.12 + Java 21 + PySpark (vía uv)
-├── .env                     # muestra de datos: DS_QUARTER, DS_START, DS_DAYS
-├── docker-compose.yml       # image, download, spark-master, spark-worker ×N, part-a, part-b
+├── .env                     # muestra de datos (DS_*) y parámetros del streaming (STREAM_*)
+├── docker-compose.yml       # infraestructura (image, spark-master, spark-worker ×N, kafka),
+│                            # pipeline (pipeline-a → b → c) y partes sueltas (part-a, part-b,
+│                            # part-c, part-c-producer, download)
 ├── conf/log4j2.properties   # logs de Spark en WARN
 ├── docker/entrypoint.sh     # anuncia la IP del contenedor a los demás nodos de Spark
 ├── docker/with-data.sh      # valida/descarga la muestra y después lanza el job
@@ -196,7 +250,13 @@ PYTHONPATH=. uv run spark-submit --master "local[*]" part_b/job.py
 │   ├── job.py               # punto de entrada de spark-submit
 │   ├── balancing.py         # tiempos por particiones y sesgo del reparto por modelo
 │   └── README.md            # lógica, resultados y explicación del sesgo
-└── tests/                   # test_metrics.py, test_download.py, test_part_b.py
+├── part_c/
+│   ├── job.py               # punto de entrada de spark-submit
+│   ├── events.py            # formato de los eventos, muestreo y aritmética de ventanas
+│   ├── producer.py          # producer de Kafka con reloj acelerado y eventos tardíos
+│   ├── streaming.py         # Structured Streaming: ventanas, watermark y verificación
+│   └── README.md            # lógica, resultados y experimentos
+└── tests/                   # test_metrics.py, test_download.py, test_part_b.py, test_part_c.py
 ```
 
 ## Datos

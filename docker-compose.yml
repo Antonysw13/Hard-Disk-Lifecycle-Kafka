@@ -1,5 +1,11 @@
 name: harddisk-lifecycle
 
+# Pipeline completo, una etapa después de la anterior (A → B → C):
+#   docker compose up        # sale al terminar la Parte C; si una etapa falla, se detiene ahí
+#   docker compose down      # apaga Spark y Kafka
+# Cada parte por separado:
+#   docker compose run --rm part-a | part-b | part-c [argumentos del job]
+#
 # Todos los servicios usan la misma imagen (ver Dockerfile) y ven el proyecto en /app:
 # ./data → /app/data y ./output → /app/output, igual que al ejecutar en local.
 x-app: &app
@@ -16,36 +22,77 @@ x-sample: &sample
   DS_START: ${DS_START:-}
   DS_DAYS: ${DS_DAYS:-7}
 
+# Parte C: conexión a Kafka y parámetros del producer (valores por defecto en .env)
+x-stream: &stream
+  KAFKA_BOOTSTRAP: kafka:9092
+  KAFKA_TOPIC: ${KAFKA_TOPIC:-drivestats}
+  STREAM_SECONDS_PER_DAY: ${STREAM_SECONDS_PER_DAY:-10}
+  STREAM_MODELS: ${STREAM_MODELS:-}
+  STREAM_SAMPLE_PCT: ${STREAM_SAMPLE_PCT:-100}
+  STREAM_LATE_PCT: ${STREAM_LATE_PCT:-2}
+  STREAM_LATE_DAYS: ${STREAM_LATE_DAYS:-1}
+
 x-healthcheck: &healthcheck
   interval: 5s
   timeout: 5s
   retries: 30
   start_period: 10s
 
+# Las tres partes, definidas una sola vez: las usan las etapas del pipeline y las partes
+# sueltas. Cada una es un driver de Spark: with-data.sh valida la muestra (y descarga lo que
+# falte) antes de spark-submit; si la validación falla, el job no arranca.
+x-job: &job
+  <<: *app
+  command: []
+  environment: *sample
+  ports:
+    - "${SPARK_APP_UI_PORT:-4040}:4040"
+  volumes:
+    - ./data:/app/data
+    - ./output:/app/output
+
+# A: MapReduce de días-disco y fallas, verificación con DataFrames y censura
+x-part-a: &part-a
+  <<: *job
+  entrypoint: ["entrypoint.sh", "with-data.sh",
+               "spark-submit", "--master", "spark://spark-master:7077", "part_a/job.py"]
+
+# B: tiempos con 2, 8, 32 y 200 particiones y sesgo del reparto por modelo
+x-part-b: &part-b
+  <<: *job
+  entrypoint: ["entrypoint.sh", "with-data.sh",
+               "spark-submit", "--master", "spark://spark-master:7077", "part_b/job.py"]
+
+# C: vacía el topic, arranca Structured Streaming (ventanas de 7 días con watermark de 2),
+# lanza el producer y termina cuando el watermark cierra todas las ventanas
+x-part-c: &part-c
+  <<: *job
+  entrypoint: ["entrypoint.sh", "with-data.sh",
+               "spark-submit", "--master", "spark://spark-master:7077", "part_c/job.py"]
+  environment:
+    <<: [*sample, *stream]
+
+x-cluster: &cluster
+  spark-worker:
+    condition: service_healthy
+
 services:
+  # ------------------------------------------------------------- infraestructura ----
+  # `attach: false`: `docker compose up` muestra solo la salida de las etapas y termina con
+  # la última; Spark y Kafka siguen arriba hasta `docker compose down`.
+
   # Construye la imagen compartida una sola vez; el resto de servicios depende de él.
   image:
     <<: *app
     build: .
     command: ["true"]
-
-  # Solo valida / descarga la muestra, sin levantar Spark. Está en el perfil «tools» para
-  # que `docker compose up` no lo ejecute a la vez que part-a (que ya valida por su cuenta):
-  #   docker compose run --rm download [--days 14 …]
-  download:
-    <<: *app
-    profiles: ["tools"]
-    entrypoint: ["entrypoint.sh", "python", "-m", "drivestats.download"]
-    command: []
-    environment: *sample
-    volumes:
-      - ./data:/app/data
-    depends_on: *built
+    attach: false
 
   spark-master:
     <<: *app
     command: ["spark-class", "org.apache.spark.deploy.master.Master",
               "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    attach: false
     ports:
       - "${SPARK_MASTER_UI_PORT:-8080}:8080"
     depends_on: *built
@@ -58,10 +105,13 @@ services:
     <<: *app
     command: ["spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077",
               "--cores", "${SPARK_WORKER_CORES:-2}", "--memory", "${SPARK_WORKER_MEMORY:-2g}"]
+    attach: false
     deploy:
       replicas: ${SPARK_WORKERS:-2}
     volumes:
       - ./data:/app/data:ro
+      # Los executors escriben ahí el estado del streaming (checkpoints de la Parte C)
+      - ./output:/app/output
     depends_on:
       spark-master:
         condition: service_healthy
@@ -70,40 +120,104 @@ services:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8081', timeout=3)"]
 
-  # Driver de la Parte A. with-data.sh valida la muestra (y descarga lo que falte) antes de
-  # spark-submit; si la validación falla, el job no arranca. Los argumentos extra van al job:
-  #   docker compose run --rm part-a --top 40
-  part-a:
-    <<: *app
-    entrypoint: ["entrypoint.sh", "with-data.sh",
-                 "spark-submit", "--master", "spark://spark-master:7077", "part_a/job.py"]
-    command: []
-    environment: *sample
-    ports:
-      - "${SPARK_APP_UI_PORT:-4040}:4040"
-    volumes:
-      - ./data:/app/data
-      - ./output:/app/output
+  # Broker de Kafka para la Parte C: un solo nodo en modo KRaft (sin ZooKeeper). Dentro de la
+  # red de Compose se llega por kafka:9092. Los datos no se guardan: cada ejecución de la
+  # Parte C vacía el topic.
+  kafka:
+    image: apache/kafka:4.3.1
+    attach: false
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL",
+             "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+
+  # -------------------------------------------------- pipeline: `docker compose up` ----
+  # Cada etapa arranca solo cuando la anterior terminó con código 0
+  # (service_completed_successfully). Si una falla, Compose no lanza las siguientes y
+  # `docker compose up` termina con error.
+  pipeline-a:
+    <<: *part-a
+    depends_on: *cluster
+
+  pipeline-b:
+    <<: *part-b
     depends_on:
-      spark-worker:
+      <<: *cluster
+      pipeline-a:
+        condition: service_completed_successfully
+
+  pipeline-c:
+    <<: *part-c
+    depends_on:
+      <<: *cluster
+      kafka:
+        condition: service_healthy
+      pipeline-b:
+        condition: service_completed_successfully
+
+  # ------------------------------- partes sueltas: `docker compose run --rm part-X` ----
+  # Cada una en su perfil para que `docker compose up` no las ejecute a la vez que el
+  # pipeline: dos jobs en el mismo clúster se quitan núcleos y falsean los tiempos.
+  # Los argumentos extra van al job, por ejemplo:
+  #   docker compose run --rm part-a --top 40
+  #   docker compose run --rm part-b --repeats 10
+  #   docker compose run --rm part-c --late-days 4
+  part-a:
+    <<: *part-a
+    profiles: ["part-a"]
+    depends_on: *cluster
+
+  part-b:
+    <<: *part-b
+    profiles: ["part-b"]
+    depends_on: *cluster
+
+  part-c:
+    <<: *part-c
+    profiles: ["part-c"]
+    depends_on:
+      <<: *cluster
+      kafka:
         condition: service_healthy
 
-  # Driver de la Parte B: tiempos con 2, 8, 32 y 200 particiones y sesgo del reparto por
-  # modelo. Está en su propio perfil para que no corra a la vez que part-a: dos jobs en el
-  # mismo clúster se quitan núcleos y falsean los tiempos.
-  #   docker compose run --rm part-b --repeats 10
-  part-b:
+  # Solo valida / descarga la muestra, sin levantar Spark:
+  #   docker compose run --rm download [--days 14 …]
+  download:
     <<: *app
-    profiles: ["part-b"]
-    entrypoint: ["entrypoint.sh", "with-data.sh",
-                 "spark-submit", "--master", "spark://spark-master:7077", "part_b/job.py"]
+    profiles: ["tools"]
+    entrypoint: ["entrypoint.sh", "python", "-m", "drivestats.download"]
     command: []
     environment: *sample
-    ports:
-      - "${SPARK_APP_UI_PORT:-4040}:4040"
     volumes:
       - ./data:/app/data
+    depends_on: *built
+
+  # Producer suelto, para publicar desde otro terminal mientras corre
+  # `docker compose run --rm part-c --no-producer`:
+  #   docker compose run --rm part-c-producer [--seconds-per-day 5 …]
+  part-c-producer:
+    <<: *app
+    profiles: ["producer"]
+    entrypoint: ["entrypoint.sh", "python", "-m", "part_c.producer",
+                 "--report", "output/part_c/productor.json"]
+    command: []
+    environment: *stream
+    volumes:
+      - ./data:/app/data:ro
       - ./output:/app/output
     depends_on:
-      spark-worker:
+      kafka:
         condition: service_healthy

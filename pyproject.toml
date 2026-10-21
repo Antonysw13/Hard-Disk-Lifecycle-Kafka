@@ -5,6 +5,7 @@ description = "¿Cuánto viven los discos? MapReduce, balanceo de carga y stream
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "confluent-kafka>=2.16,<3",
     "pyspark>=4.2,<4.3",
 ]
 
